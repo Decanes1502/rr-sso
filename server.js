@@ -1,5 +1,6 @@
 import { PrismaClient } from '@prisma/client';
 const prisma = new PrismaClient();
+import bcrypt from 'bcryptjs';
 import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
@@ -56,6 +57,92 @@ function auth(req, res, next) {
 
 // Health
 app.get('/api/health', (_, res) => res.json({ ok: true }));
+// POST /api/users/provision
+// Body: { email, password, name, locationId?, brand?: { logo, name, street, zipcity, person, phone, mail, web, validity_days, payment_terms, cancellation_notice, agb_link } }
+// Antwort: { ok:true, user:{...}, brand:{...}, token:"..." }
+app.post('/api/users/provision', async (req, res) => {
+  try {
+    const { email, password, name, locationId, brand } = req.body || {};
+
+    // Minimal-Validierung
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: 'email, password, name required' });
+    }
+
+    // Existiert der User schon?
+    const existing = await prisma.user.findUnique({ where: { email: String(email).toLowerCase() } });
+    if (existing) {
+      return res.status(409).json({ error: 'user_already_exists' });
+    }
+
+    // locationId wählen/erzeugen
+    const locId = locationId && String(locationId).trim()
+      ? String(locationId).trim()
+      : `loc_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Brand (optional) upsert (ID = locationId)
+    let savedBrand = null;
+    if (brand && typeof brand === 'object') {
+      const clean = {
+        id: locId,
+        logo:               brand.logo ?? null,
+        name:               brand.name ?? null,
+        street:             brand.street ?? null,
+        zipcity:            brand.zipcity ?? null,
+        person:             brand.person ?? null,
+        phone:              brand.phone ?? null,
+        mail:               brand.mail ?? null,
+        web:                brand.web ?? null,
+        validity_days:      brand.validity_days ?? null,
+        payment_terms:      brand.payment_terms ?? null,
+        cancellation_notice:brand.cancellation_notice ?? null,
+        agb_link:           brand.agb_link ?? null
+      };
+      savedBrand = await prisma.brand.upsert({
+        where: { id: locId },
+        update: clean,
+        create: clean
+      });
+    } else {
+      // falls keine Brand übergeben wurde, aber es existiert schon eine, holen wir sie später nochmal
+      savedBrand = await prisma.brand.findUnique({ where: { id: locId } });
+    }
+
+    // Passwort hashen (sicher!)
+    const passwordHash = await bcrypt.hash(String(password), 10);
+
+    // User anlegen
+    const user = await prisma.user.create({
+      data: {
+        email: String(email).toLowerCase(),
+        password: passwordHash,
+        name: String(name),
+        locationId: locId
+      },
+      select: { id: true, email: true, name: true, locationId: true }
+    });
+
+    // JWT bauen (nutzt deine vorhandene signToken-Funktion)
+    // Falls du signToken noch nicht hast, sag Bescheid – ich gebe dir den Helper.
+    const token = signToken({
+      sub: user.id,
+      email: user.email,
+      name: user.name,
+      locationId: user.locationId
+    });
+
+    // Brand ggf. nachladen (falls oben nicht angelegt)
+    if (!savedBrand) {
+      savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
+    }
+
+    return res.json({ ok: true, user, brand: savedBrand, token });
+  } catch (err) {
+    console.error('provision error', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 
 // POST /api/session/login { email, password } -> { token }
 app.post('/api/session/login', (req, res) => {
