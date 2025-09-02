@@ -414,6 +414,55 @@ function listRoutes() {
   return routes.sort();
 }
 app.get('/api/_routes', (_req, res) => res.json({ routes: listRoutes() }));
+app.get('/api/subscription/status', async (req, res) => {
+  try {
+    const hdr = req.headers['authorization'] || '';
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+
+    let payload;
+    try {
+      payload = jwt.verify(token, process.env.JWT_SECRET || 'dev-secret');
+    } catch {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    const secret = process.env.STRIPE_SECRET_KEY || '';
+    const allowedIds = (process.env.ALLOWED_PRICE_IDS || process.env.STRIPE_PRICE_ID || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    if (!secret || allowedIds.length === 0) return res.json({ status: 'none' });
+
+    const stripe = new Stripe(secret, { apiVersion: '2023-10-16' });
+
+    const email = (payload.email || '').toLowerCase();
+    if (!email) return res.json({ status: 'none' });
+
+    const customers = await stripe.customers.list({ email, limit: 10 });
+    if (!customers?.data?.length) return res.json({ status: 'none' });
+
+    const allowed = new Set(allowedIds);
+    const interesting = new Set(['active','trialing','past_due','incomplete','canceled','unpaid','incomplete_expired']);
+    let fallback = null;
+
+    for (const c of customers.data) {
+      const subs = await stripe.subscriptions.list({
+        customer: c.id, status: 'all', limit: 20, expand: ['data.items']
+      });
+      for (const s of subs.data) {
+        if (!interesting.has(s.status)) continue;
+        const okPrice = (s.items?.data || []).some(it => it.price && allowed.has(it.price.id));
+        if (!okPrice) continue;
+
+        if (s.status === 'active' || s.status === 'trialing') return res.json({ status: s.status });
+        fallback = fallback || s.status;
+      }
+    }
+    return res.json({ status: fallback || 'none' });
+  } catch (err) {
+    console.error('[status] error', err);
+    return res.status(500).json({ status: 'none', error: 'internal_error' });
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`RR-SSO listening on :${PORT}`);
