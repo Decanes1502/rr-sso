@@ -274,6 +274,13 @@ async function brandSyncHandler(req, res) {
 app.post('/api/brand/sync', brandSyncHandler);
 app.patch('/api/brand/sync', brandSyncHandler); // optional: echter PATCH
 
+console.log('RR-SSO boot:',
+  { 
+    billingEnabled: !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_PRICE_ID),
+    hasStripeSecret: !!process.env.STRIPE_SECRET_KEY,
+    hasPriceId: !!process.env.STRIPE_PRICE_ID
+  }
+);
 
 // ----------- Start -----------
 app.listen(PORT, () => {
