@@ -65,6 +65,13 @@ function auth(req, res, next) {
 // ----------- Health -----------
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
+// Zeigt, ob Billing serverseitig aktiv ist (Stripe Keys vorhanden)
+app.get('/api/billing/enabled', (_req, res) => {
+  const enabled = !!(process.env.STRIPE_SECRET_KEY && process.env.STRIPE_PRICE_ID);
+  res.json({ enabled });
+});
+
+
 // ----------- Provision: User + (optional) Brand anlegen -----------
 /**
  * POST /api/users/provision
