@@ -392,6 +392,29 @@ console.log('RR-SSO boot:', {
   allowedOrigins: ALLOWED_ORIGINS,
 });
 
+// ===== Debug: Version + alle registrierten Routen (nur fürs Troubleshooting)
+app.get('/api/_ping', (_req, res) => {
+  res.json({ ok: true, version: 'serverjs-2025-09-02-18h' });
+});
+
+function listRoutes() {
+  const routes = [];
+  (app._router?.stack || []).forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods || {}).map(x => x.toUpperCase()).join(',');
+      routes.push(`${methods} ${m.route.path}`);
+    } else if (m.name === 'router' && m.handle?.stack) {
+      m.handle.stack.forEach((h) => {
+        const p = h.route && h.route.path;
+        const mth = h.route && Object.keys(h.route.methods || {}).map(x => x.toUpperCase()).join(',');
+        if (p && mth) routes.push(`${mth} ${p}`);
+      });
+    }
+  });
+  return routes.sort();
+}
+app.get('/api/_routes', (_req, res) => res.json({ routes: listRoutes() }));
+
 app.listen(PORT, () => {
   console.log(`RR-SSO listening on :${PORT}`);
 });
