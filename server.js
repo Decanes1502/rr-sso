@@ -12,6 +12,10 @@ dotenv.config();
 
 const app = express();
 const prisma = new PrismaClient();
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID;
+const ALLOWED_PRICE_IDS = (process.env.ALLOWED_PRICE_IDS || STRIPE_PRICE_ID || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
 
 // ----------- Basics -----------
 app.use(express.json({ limit: '1mb' }));
