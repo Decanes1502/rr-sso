@@ -18,7 +18,7 @@ model User {
 }
 
 model Brand {
-  id                  String   @id
+  id                  String   @id @default(cuid())  // <- Auto-ID hinzugefügt
   logo                String?
   name                String?
   street              String?
@@ -32,32 +32,4 @@ model Brand {
   cancellation_notice String?
   agb_link            String?
   users               User[]
-}
-// >>> RR BRAND MODELS <<<
-model User {
-  id        String   @id @default(cuid())
-  email     String   @unique
-  password  String
-  brand     Brand?
-  createdAt DateTime @default(now())
-}
-
-model Brand {
-  id          String  @id @default(cuid())
-  userId      String  @unique
-  user        User    @relation(fields: [userId], references: [id])
-
-  name        String?
-  street      String?
-  zipcity     String?
-  person      String?
-  phone       String?
-  mail        String?
-  web         String?
-  logo        String?  // wir speichern hier erstmal eine DataURL (einfachster Weg)
-
-  validity_days        String?
-  payment_terms        String?
-  cancellation_notice  String?
-  agb_link             String?
 }
