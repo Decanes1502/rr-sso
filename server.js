@@ -203,46 +203,66 @@ app.get('/api/me', auth, async (req, res) => {
   }
 });
 
-// ----------- Brand Sync: upsert per locationId -----------
+// ----------- Brand Sync (PATCH/MERGE): nur gesendete Felder ändern, Rest behalten -----------
 /**
- * POST /api/brand/sync
- * Body: { locationId, logo?, name?, street?, zipcity?, person?, phone?, mail?, web?, validity_days?, payment_terms?, cancellation_notice?, agb_link? }
- * Response: { ok:true, brand:{...} }
+ * POST /api/brand/sync  (Patch-Semantik)
+ * PATCH /api/brand/sync (Alias)
+ * Body (Beispiele):
+ *   { locationId, name: "Neu GmbH" }                    -> nur Name ändern
+ *   { locationId, logo: null }                          -> Logo explizit löschen
+ *   { locationId, logo: "data:image/png;base64,..." }   -> Logo setzen
+ *
+ * Regel:
+ *   - Felder, die im Body NICHT vorkommen (=== undefined), bleiben unverändert.
+ *   - Felder, die mit "null" kommen, werden auf null gesetzt (explizites Löschen).
  */
-app.post('/api/brand/sync', async (req, res) => {
+async function brandSyncHandler(req, res) {
   try {
-    const b = req.body || {};
-    const locationId = b.locationId && String(b.locationId).trim();
+    const body = req.body || {};
+    const locationId = body.locationId && String(body.locationId).trim();
     if (!locationId) return res.status(400).json({ error: 'locationId required' });
 
-    const clean = {
-      id: locationId,
-      logo: b.logo ?? null,
-      name: b.name ?? null,
-      street: b.street ?? null,
-      zipcity: b.zipcity ?? null,
-      person: b.person ?? null,
-      phone: b.phone ?? null,
-      mail: b.mail ?? null,
-      web: b.web ?? null,
-      validity_days: b.validity_days ?? null,
-      payment_terms: b.payment_terms ?? null,
-      cancellation_notice: b.cancellation_notice ?? null,
-      agb_link: b.agb_link ?? null,
-    };
+    const allowedFields = [
+      'logo','name','street','zipcity','person','phone','mail','web',
+      'validity_days','payment_terms','cancellation_notice','agb_link'
+    ];
 
-    const saved = await prisma.brand.upsert({
-      where: { id: locationId },
-      update: clean,
-      create: clean,
-    });
+    // Vorhandene Brand holen (kann null sein)
+    const existing = await prisma.brand.findUnique({ where: { id: locationId } });
+
+    // Patch bauen: nur gesendete Keys überschreiben; undefined = unverändert; null = löschen
+    const patch = {};
+    for (const k of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(body, k)) {
+        patch[k] = body[k]; // kann Wert oder null sein
+      }
+    }
+
+    let saved;
+    if (existing) {
+      // Merge: vorhandene + Patch (nur gesendete Keys überschreiben)
+      const merged = { ...existing, ...patch };
+      // Prisma-update: keine id in data mitschicken
+      const { id, ...data } = merged;
+      saved = await prisma.brand.update({ where: { id: locationId }, data });
+    } else {
+      // Neu anlegen: id + Patch; nicht gesendete Keys = null
+      const data = { id: locationId };
+      for (const k of allowedFields) {
+        data[k] = Object.prototype.hasOwnProperty.call(patch, k) ? patch[k] : null;
+      }
+      saved = await prisma.brand.create({ data });
+    }
 
     return res.json({ ok: true, brand: saved });
   } catch (err) {
     console.error('brand sync error', err);
     return res.status(500).json({ error: 'internal_error' });
   }
-});
+}
+app.post('/api/brand/sync', brandSyncHandler);
+app.patch('/api/brand/sync', brandSyncHandler); // optional: echter PATCH
+
 
 // ----------- Start -----------
 app.listen(PORT, () => {
