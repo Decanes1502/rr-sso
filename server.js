@@ -319,17 +319,17 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
     };
 
-    // <<< WICHTIG: KEIN customer_creation, KEIN customer_update >>>
+    // Wichtig: KEIN "customer" & keine customer_update/customer_creation
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: req.user.email,                // Kunde per E-Mail
+      customer_email: req.user.email,                // Kunde per E-Mail binden
       line_items: [{ price: chosenPrice, quantity: 1 }],
       allow_promotion_codes: true,
       client_reference_id: req.user.sub,
       success_url: success,
       cancel_url: cancel,
 
-      // Steuer aktiv + Adress-/USt-ID-Abfrage
+      // Steuer aktivieren + Adress-/USt-ID-Abfrage
       automatic_tax: { enabled: true },
       billing_address_collection: 'required',
       tax_id_collection: { enabled: true },
@@ -344,20 +344,6 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error('checkout error:', {
-      message: err?.message,
-      rawMessage: err?.raw?.message,
-      rawParam: err?.raw?.param,
-      statusCode: err?.statusCode
-    });
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-
-    return res.json({ url: session.url });
-  } catch (err) {
-    // kompaktes, hilfreiches Logging
     console.error('checkout error:', {
       message: err?.message,
       rawMessage: err?.raw?.message,
@@ -463,7 +449,7 @@ app.get('/api/subscription/status', async (req, res) => {
 
 // ===== Debug: Ping & Routenliste
 app.get('/api/_ping', (_req, res) => {
-  res.json({ ok: true, version: 'serverjs-2025-09-03-robust-tax' });
+  res.json({ ok: true, version: 'serverjs-2025-09-03-tax-enabled' });
 });
 function listRoutes() {
   const routes = [];
