@@ -292,7 +292,12 @@ async function brandSyncHandler(req, res) {
 app.post('/api/brand/sync', brandSyncHandler);
 app.patch('/api/brand/sync', brandSyncHandler);
 
-// ======== Billing: Checkout ========
+// ======== Billing: Checkout (Stripe Tax aktiviert) ========
+/**
+ * POST /api/billing/checkout  (Authorization: Bearer <token>)
+ * Startet Stripe Checkout (Subscription) mit automatischer Steuer (Stripe Tax).
+ * Returns: { url }
+ */
 app.post('/api/billing/checkout', auth, async (req, res) => {
   try {
     if (!stripe || !billingEnabled()) {
@@ -310,55 +315,57 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
     const success = `${APP_BASE_URL}?checkout=success`;
     const cancel  = `${APP_BASE_URL}?checkout=cancel`;
 
-    // Wie im erfolgreichen curl: KEIN "customer", stattdessen "customer_email"
     const subscription_data = {
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
         rr_email: req.user.email,
       },
+      ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
     };
-    if (TRIAL_DAYS > 0) subscription_data.trial_period_days = TRIAL_DAYS;
 
+    // *** WICHTIG für MwSt. (Stripe Tax) ***
     const session = await stripe.checkout.sessions.create({
-  mode: 'subscription',
+      mode: 'subscription',
 
-  // Wichtig: keine feste customer-ID erzwingen; E-Mail reicht,
-  // Stripe legt/zuordnet den Customer automatisch
-  customer_email: req.user.email,
+      // Kunde per E-Mail — Stripe legt/zuordnet Customer selbst
+      customer_email: req.user.email,
 
-  // === Steuer & Adressaufnahme ===
-  // Stripe Tax aktivieren
-  automatic_tax: { enabled: true },
-  // Rechnungsadresse einsammeln (für DE-VAT zwingend nötig)
-  billing_address_collection: 'required',
-  // USt-Id (falls B2B) abfragen lassen
-  tax_id_collection: { enabled: true },
-  // Customer automatisch updaten, damit Adresse persistent ist
-  customer_creation: 'always',
-  customer_update: { address: 'auto', name: 'auto' },
+      // Steuer & Adressaufnahme
+      automatic_tax: { enabled: true },
+      billing_address_collection: 'required',
+      tax_id_collection: { enabled: true },
 
-  allow_promotion_codes: true,
-  client_reference_id: req.user.sub,
-  line_items: [{ price: chosenPrice, quantity: 1 }],
-  success_url: success,
-  cancel_url: cancel,
+      // Adresse/Name am Customer speichern (für Folgerechnungen)
+      customer_creation: 'always',
+      customer_update: { address: 'auto', name: 'auto' },
 
-  subscription_data: {
-    ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
-    metadata: {
-      rr_user_id: req.user.sub,
-      rr_location_id: req.user.locationId,
-      rr_email: req.user.email,
-    },
-  },
-  metadata: {
-    rr_user_id: req.user.sub,
-    rr_location_id: req.user.locationId,
-    rr_email: req.user.email,
-  },
+      allow_promotion_codes: true,
+      client_reference_id: req.user.sub,
+      line_items: [{ price: chosenPrice, quantity: 1 }],
+      success_url: success,
+      cancel_url: cancel,
+
+      subscription_data,
+      metadata: {
+        rr_user_id: req.user.sub,
+        rr_location_id: req.user.locationId,
+        rr_email: req.user.email,
+      },
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    // kompaktes, hilfreiches Logging
+    console.error('checkout error:', {
+      message: err?.message,
+      rawMessage: err?.raw?.message,
+      rawParam: err?.raw?.param,
+      statusCode: err?.statusCode
+    });
+    return res.status(500).json({ error: 'internal_error' });
+  }
 });
-
 
 /**
  * GET /api/subscription/status
@@ -455,7 +462,7 @@ app.get('/api/subscription/status', async (req, res) => {
 
 // ===== Debug: Ping & Routenliste
 app.get('/api/_ping', (_req, res) => {
-  res.json({ ok: true, version: 'serverjs-2025-09-03-robust' });
+  res.json({ ok: true, version: 'serverjs-2025-09-03-robust-tax' });
 });
 function listRoutes() {
   const routes = [];
