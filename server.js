@@ -337,46 +337,89 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/subscription/status  (Authorization: Bearer <token>)
- * Returns: { status: 'active'|'trialing'|'past_due'|'incomplete'|'canceled'|'none' }
- * Logik: Sucht Stripe-Customer(s) via E-Mail und prüft Subscriptions auf zugelassene Preise.
- */
-app.get('/api/subscription/status', auth, async (req, res) => {
+// ===== Subscription Status (defensiv: niemals 500, immer JSON) =====
+app.get('/api/subscription/status', async (req, res) => {
   try {
-    if (!stripe || !billingEnabled()) return res.json({ status: 'none' });
+    const SECRET = process.env.STRIPE_SECRET_KEY || '';
+    const PRICE_IDS = (process.env.ALLOWED_PRICE_IDS || process.env.STRIPE_PRICE_ID || '')
+      .split(',').map(s => s.trim()).filter(Boolean);
+    const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
-    const email = (req.user?.email || '').toLowerCase();
-    if (!email) return res.json({ status: 'none' });
+    // helper: immer 200 antworten
+    const ok = (obj) => res.status(200).json(obj);
 
-    // 1) Customer(s) nach E-Mail suchen
-    const customers = await stripe.customers.list({ email, limit: 10 });
-    if (!customers?.data?.length) return res.json({ status: 'none' });
+    // Token lesen (optional; ohne Token -> none)
+    const hdr = req.headers['authorization'] || '';
+    const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+    if (!token) return ok({ status: 'none', reason: 'missing_token' });
 
-    // 2) Für alle Customers Subscriptions prüfen
-    const allowed = new Set(ALLOWED_PRICE_IDS);
-    const interestingStatuses = ['active', 'trialing', 'past_due', 'incomplete', 'canceled', 'unpaid', 'incomplete_expired'];
+    let email = '';
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      email = String(payload.email || '').toLowerCase();
+      if (!email) return ok({ status: 'none', reason: 'token_without_email' });
+    } catch {
+      return ok({ status: 'none', reason: 'invalid_token' });
+    }
 
-    for (const c of customers.data) {
-      const subs = await stripe.subscriptions.list({ customer: c.id, status: 'all', limit: 20, expand: ['data.items'] });
-      for (const s of subs.data) {
-        if (!interestingStatuses.includes(s.status)) continue;
-        const hasAllowedPrice = (s.items?.data || []).some(it => it.price && allowed.has(it.price.id));
-        if (!hasAllowedPrice) continue;
+    // Stripe nicht konfiguriert? -> neutral zurück
+    if (!SECRET || PRICE_IDS.length === 0) {
+      return ok({ status: 'none', reason: 'not_configured' });
+    }
 
-        // Priorität: active/trialing > past_due/incomplete > canceled/none
+    const stripe = new Stripe(SECRET, { apiVersion: '2023-10-16' });
+
+    // Kunden per E-Mail suchen
+    let customers = [];
+    try {
+      const list = await stripe.customers.list({ email, limit: 10 });
+      customers = list?.data || [];
+    } catch {
+      return ok({ status: 'none', reason: 'stripe_customers_error' });
+    }
+    if (customers.length === 0) {
+      return ok({ status: 'none', reason: 'no_customer' });
+    }
+
+    // Subscriptions checken
+    const allowed = new Set(PRICE_IDS);
+    const interesting = new Set([
+      'active','trialing','past_due','incomplete','canceled','unpaid','incomplete_expired'
+    ]);
+    let fallback = null;
+
+    for (const c of customers) {
+      let subs = [];
+      try {
+        const list = await stripe.subscriptions.list({
+          customer: c.id,
+          status: 'all',
+          limit: 20,
+          expand: ['data.items']
+        });
+        subs = list?.data || [];
+      } catch {
+        continue; // nächsten Kunden probieren
+      }
+
+      for (const s of subs) {
+        if (!interesting.has(s.status)) continue;
+        const matches = (s.items?.data || []).some(it => it.price && allowed.has(it.price.id));
+        if (!matches) continue;
+
         if (s.status === 'active' || s.status === 'trialing') {
-          return res.json({ status: s.status });
+          return ok({ status: s.status }); // Jackpot
         }
-        // ansonsten merken, falls nichts Besseres kommt
-        var fallback = s.status; // eslint-disable-line no-var
+        // leichtere Fälle merken (past_due etc.)
+        fallback = fallback || s.status;
       }
     }
 
-    return res.json({ status: fallback || 'none' });
+    return ok({ status: fallback ? 'none' : 'none', reason: fallback ? 'non_active_subscription' : 'no_subscription' });
   } catch (err) {
-    console.error('status error', err);
-    return res.status(500).json({ status: 'none', error: 'internal_error' });
+    console.error('[subscription/status] fatal', err);
+    // Wichtig: niemals 500 rausgeben
+    return res.status(200).json({ status: 'none', reason: 'fatal_error' });
   }
 });
 
