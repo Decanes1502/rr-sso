@@ -321,31 +321,42 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
     if (TRIAL_DAYS > 0) subscription_data.trial_period_days = TRIAL_DAYS;
 
     const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer_email: req.user.email,          // <- wichtig
-      allow_promotion_codes: true,
-      client_reference_id: req.user.sub,
-      line_items: [{ price: chosenPrice, quantity: 1 }],
-      success_url: success,
-      cancel_url: cancel,
-      subscription_data,
-      metadata: {
-        rr_user_id: req.user.sub,
-        rr_location_id: req.user.locationId,
-        rr_email: req.user.email,
-      },
-    });
+  mode: 'subscription',
 
-    return res.json({ url: session.url });
-  } catch (err) {
-    // kompakteres, hilfreiches Logging
-    console.error('checkout error:',
-      err?.message,
-      err?.raw?.message,
-      err?.raw?.param
-    );
-    return res.status(500).json({ error: 'internal_error' });
-  }
+  // Wichtig: keine feste customer-ID erzwingen; E-Mail reicht,
+  // Stripe legt/zuordnet den Customer automatisch
+  customer_email: req.user.email,
+
+  // === Steuer & Adressaufnahme ===
+  // Stripe Tax aktivieren
+  automatic_tax: { enabled: true },
+  // Rechnungsadresse einsammeln (für DE-VAT zwingend nötig)
+  billing_address_collection: 'required',
+  // USt-Id (falls B2B) abfragen lassen
+  tax_id_collection: { enabled: true },
+  // Customer automatisch updaten, damit Adresse persistent ist
+  customer_creation: 'always',
+  customer_update: { address: 'auto', name: 'auto' },
+
+  allow_promotion_codes: true,
+  client_reference_id: req.user.sub,
+  line_items: [{ price: chosenPrice, quantity: 1 }],
+  success_url: success,
+  cancel_url: cancel,
+
+  subscription_data: {
+    ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
+    metadata: {
+      rr_user_id: req.user.sub,
+      rr_location_id: req.user.locationId,
+      rr_email: req.user.email,
+    },
+  },
+  metadata: {
+    rr_user_id: req.user.sub,
+    rr_location_id: req.user.locationId,
+    rr_email: req.user.email,
+  },
 });
 
 
