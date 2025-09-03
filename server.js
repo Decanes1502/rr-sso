@@ -292,93 +292,62 @@ async function brandSyncHandler(req, res) {
 app.post('/api/brand/sync', brandSyncHandler);
 app.patch('/api/brand/sync', brandSyncHandler);
 
-// ======== Billing: Checkout & Status ========
-
-/**
- * POST /api/billing/checkout  (Authorization: Bearer <token>)
- * Startet Stripe Checkout (Subscription). Returns: { url }
- * Robust: bindet Customer an rr_user_id, damit E-Mail-Abweichungen im Checkout egal sind.
- */
+// ======== Billing: Checkout ========
 app.post('/api/billing/checkout', auth, async (req, res) => {
   try {
-    if (!stripe || !billingEnabled()) return res.status(400).json({ error: 'billing_disabled' });
+    if (!stripe || !billingEnabled()) {
+      return res.status(400).json({ error: 'billing_disabled' });
+    }
 
     const { price_id } = req.body || {};
     const chosenPrice = (price_id && ALLOWED_PRICE_IDS.includes(price_id))
       ? price_id
       : (STRIPE_PRICE_ID || ALLOWED_PRICE_IDS[0]);
-    if (!chosenPrice) return res.status(400).json({ error: 'no_price_configured' });
-
-    // ---- Customer zu diesem App-User finden/erstellen (Bindung an rr_user_id)
-    const email = req.user.email;
-    let customerId = null;
-
-    // 1) Primär: Search API über rr_user_id (metadata)
-    try {
-      const found = await stripe.customers.search({
-        query: `metadata['rr_user_id']:"${req.user.sub}"`,
-        limit: 1
-      });
-      if (found?.data?.length) customerId = found.data[0].id;
-    } catch {
-      // ignorieren, wir fallen zurück
-    }
-
-    // 2) Fallback: per E-Mail
-    if (!customerId) {
-      try {
-        const list = await stripe.customers.list({ email, limit: 1 });
-        if (list?.data?.length) {
-          customerId = list.data[0].id;
-          await stripe.customers.update(customerId, {
-            metadata: { rr_user_id: req.user.sub, rr_location_id: req.user.locationId }
-          });
-        }
-      } catch { /* ignorieren, ggf. neu anlegen */ }
-    }
-
-    // 3) Neu anlegen
-    if (!customerId) {
-      const created = await stripe.customers.create({
-        email,
-        metadata: { rr_user_id: req.user.sub, rr_location_id: req.user.locationId }
-      });
-      customerId = created.id;
+    if (!chosenPrice) {
+      return res.status(400).json({ error: 'no_price_configured' });
     }
 
     const success = `${APP_BASE_URL}?checkout=success`;
     const cancel  = `${APP_BASE_URL}?checkout=cancel`;
 
-    // Checkout-Session mit "customer" (nicht customer_email)
+    // Wie im erfolgreichen curl: KEIN "customer", stattdessen "customer_email"
+    const subscription_data = {
+      metadata: {
+        rr_user_id: req.user.sub,
+        rr_location_id: req.user.locationId,
+        rr_email: req.user.email,
+      },
+    };
+    if (TRIAL_DAYS > 0) subscription_data.trial_period_days = TRIAL_DAYS;
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer: customerId,
+      customer_email: req.user.email,          // <- wichtig
       allow_promotion_codes: true,
       client_reference_id: req.user.sub,
       line_items: [{ price: chosenPrice, quantity: 1 }],
       success_url: success,
       cancel_url: cancel,
-      subscription_data: {
-        ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
-        metadata: {
-          rr_user_id: req.user.sub,
-          rr_location_id: req.user.locationId,
-          rr_email: email
-        }
-      },
+      subscription_data,
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
-        rr_email: email
+        rr_email: req.user.email,
       },
     });
 
     return res.json({ url: session.url });
   } catch (err) {
-    console.error('checkout error', err);
+    // kompakteres, hilfreiches Logging
+    console.error('checkout error:',
+      err?.message,
+      err?.raw?.message,
+      err?.raw?.param
+    );
     return res.status(500).json({ error: 'internal_error' });
   }
 });
+
 
 /**
  * GET /api/subscription/status
