@@ -91,7 +91,6 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     }
 
     // Optional: hier DB-Flags setzen, E-Mails, etc.
-
     return res.status(200).send('[ok]');
   } catch (err) {
     console.error('[webhook] verify failed:', err.message);
@@ -298,6 +297,7 @@ app.patch('/api/brand/sync', brandSyncHandler);
 /**
  * POST /api/billing/checkout  (Authorization: Bearer <token>)
  * Startet Stripe Checkout (Subscription). Returns: { url }
+ * Robust: bindet Customer an rr_user_id, damit E-Mail-Abweichungen im Checkout egal sind.
  */
 app.post('/api/billing/checkout', auth, async (req, res) => {
   try {
@@ -307,25 +307,69 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
     const chosenPrice = (price_id && ALLOWED_PRICE_IDS.includes(price_id))
       ? price_id
       : (STRIPE_PRICE_ID || ALLOWED_PRICE_IDS[0]);
-
     if (!chosenPrice) return res.status(400).json({ error: 'no_price_configured' });
+
+    // ---- Customer zu diesem App-User finden/erstellen (Bindung an rr_user_id)
+    const email = req.user.email;
+    let customerId = null;
+
+    // 1) Primär: Search API über rr_user_id (metadata)
+    try {
+      const found = await stripe.customers.search({
+        query: `metadata['rr_user_id']:"${req.user.sub}"`,
+        limit: 1
+      });
+      if (found?.data?.length) customerId = found.data[0].id;
+    } catch {
+      // ignorieren, wir fallen zurück
+    }
+
+    // 2) Fallback: per E-Mail
+    if (!customerId) {
+      try {
+        const list = await stripe.customers.list({ email, limit: 1 });
+        if (list?.data?.length) {
+          customerId = list.data[0].id;
+          await stripe.customers.update(customerId, {
+            metadata: { rr_user_id: req.user.sub, rr_location_id: req.user.locationId }
+          });
+        }
+      } catch { /* ignorieren, ggf. neu anlegen */ }
+    }
+
+    // 3) Neu anlegen
+    if (!customerId) {
+      const created = await stripe.customers.create({
+        email,
+        metadata: { rr_user_id: req.user.sub, rr_location_id: req.user.locationId }
+      });
+      customerId = created.id;
+    }
 
     const success = `${APP_BASE_URL}?checkout=success`;
     const cancel  = `${APP_BASE_URL}?checkout=cancel`;
 
+    // Checkout-Session mit "customer" (nicht customer_email)
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
+      customer: customerId,
       allow_promotion_codes: true,
-      customer_email: req.user.email,
       client_reference_id: req.user.sub,
       line_items: [{ price: chosenPrice, quantity: 1 }],
       success_url: success,
       cancel_url: cancel,
-      subscription_data: TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : undefined,
+      subscription_data: {
+        ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
+        metadata: {
+          rr_user_id: req.user.sub,
+          rr_location_id: req.user.locationId,
+          rr_email: email
+        }
+      },
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
-        rr_email: req.user.email,
+        rr_email: email
       },
     });
 
@@ -338,7 +382,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
 
 /**
  * GET /api/subscription/status
- * Defensiv: immer 200 + JSON. Nutzt JWT, sucht Customer per E-Mail, prüft Subscriptions gegen ALLOWED_PRICE_IDS.
+ * Defensiv: immer 200 + JSON. Prüft zuerst per rr_user_id (metadata), dann per E-Mail.
  */
 app.get('/api/subscription/status', async (req, res) => {
   try {
@@ -349,11 +393,9 @@ app.get('/api/subscription/status', async (req, res) => {
     const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
     if (!token) return ok({ status: 'none', reason: 'missing_token' });
 
-    let email = '';
+    let payload;
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      email = String(payload.email || '').toLowerCase();
-      if (!email) return ok({ status: 'none', reason: 'token_without_email' });
+      payload = jwt.verify(token, JWT_SECRET);
     } catch {
       return ok({ status: 'none', reason: 'invalid_token' });
     }
@@ -363,7 +405,24 @@ app.get('/api/subscription/status', async (req, res) => {
       return ok({ status: 'none', reason: 'not_configured' });
     }
 
-    // Kunden per E-Mail suchen
+    const allowed = new Set(ALLOWED_PRICE_IDS);
+
+    // 1) Primär: per rr_user_id in Subscription-Metadata (Search API)
+    try {
+      const q = `metadata['rr_user_id']:"${payload.sub}" AND (status:"active" OR status:"trialing")`;
+      const found = await stripe.subscriptions.search({ query: q, limit: 5, expand: ['data.items'] });
+      for (const s of (found?.data || [])) {
+        const match = (s.items?.data || []).some(it => it.price && allowed.has(it.price.id));
+        if (match) return ok({ status: s.status });
+      }
+    } catch {
+      // weiter mit E-Mail-Fallback
+    }
+
+    // 2) Fallback: per E-Mail
+    const email = String(payload.email || '').toLowerCase();
+    if (!email) return ok({ status: 'none', reason: 'token_without_email' });
+
     let customers = [];
     try {
       const list = await stripe.customers.list({ email, limit: 10 });
@@ -375,8 +434,6 @@ app.get('/api/subscription/status', async (req, res) => {
       return ok({ status: 'none', reason: 'no_customer' });
     }
 
-    // Subscriptions checken
-    const allowed = new Set(ALLOWED_PRICE_IDS);
     const interesting = new Set([
       'active','trialing','past_due','incomplete','canceled','unpaid','incomplete_expired'
     ]);
@@ -418,7 +475,7 @@ app.get('/api/subscription/status', async (req, res) => {
 
 // ===== Debug: Ping & Routenliste
 app.get('/api/_ping', (_req, res) => {
-  res.json({ ok: true, version: 'serverjs-2025-09-03' });
+  res.json({ ok: true, version: 'serverjs-2025-09-03-robust' });
 });
 function listRoutes() {
   const routes = [];
