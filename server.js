@@ -175,13 +175,35 @@ app.post('/api/users/provision', async (req, res) => {
         update: clean,
         create: clean,
       });
-// ==== COMPAT: /api/session/signup (Alias für /api/users/provision) ====
+    }
+
+    // Passwort sichern
+    const passwordHash = await bcrypt.hash(String(password), 10);
+
+    const user = await prisma.user.create({
+      data: { email: emailLc, password: passwordHash, name: String(name), locationId: locId },
+      select: { id: true, email: true, name: true, locationId: true },
+    });
+
+    const savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
+
+    const token = signToken({ sub: user.id, email: user.email, name: user.name, locationId: user.locationId });
+    return res.json({ ok: true, user, brand: savedBrand || null, token });
+  } catch (err) {
+    console.error('provision error', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/**
+ * POST /api/session/signup  — Alias zu /api/users/provision
+ * Body: { email, password, name?, brand? }
+ * Falls name fehlt, wird er aus brand.name oder dem Mail-Präfix erzeugt.
+ */
 app.post('/api/session/signup', async (req, res) => {
   try {
     const { email, password, name, brand } = req.body || {};
 
-    // 'name' wird von /api/users/provision verlangt.
-    // Falls das Frontend keins sendet, basteln wir eins.
     const displayName =
       name ||
       (typeof brand === 'string' ? brand : brand?.name) ||
@@ -193,14 +215,11 @@ app.post('/api/session/signup', async (req, res) => {
 
     const emailLc = String(email).toLowerCase();
 
-    // Existiert der User schon?
     const exists = await prisma.user.findUnique({ where: { email: emailLc } });
     if (exists) return res.status(409).json({ error: 'user_already_exists' });
 
-    // Location-ID erzeugen
     const locId = `loc_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Optional: Brand anlegen/patchen
     if (brand && typeof brand === 'object') {
       const clean = {
         id: locId,
@@ -220,17 +239,14 @@ app.post('/api/session/signup', async (req, res) => {
       await prisma.brand.upsert({ where: { id: locId }, update: clean, create: clean });
     }
 
-    // Passwort hashen & User anlegen
     const passwordHash = await bcrypt.hash(String(password), 10);
     const user = await prisma.user.create({
       data: { email: emailLc, password: passwordHash, name: String(displayName), locationId: locId },
       select: { id: true, email: true, name: true, locationId: true },
     });
 
-    // Brand zurückgeben (falls vorhanden)
     const savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
 
-    // JWT ausstellen (gleiche Hilfsfunktion wie oben)
     const token = signToken({
       sub: user.id,
       email: user.email,
@@ -241,26 +257,6 @@ app.post('/api/session/signup', async (req, res) => {
     return res.json({ ok: true, user, brand: savedBrand || null, token });
   } catch (err) {
     console.error('signup error', err);
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-    }
-
-    // Passwort sichern
-    const passwordHash = await bcrypt.hash(String(password), 10);
-
-    const user = await prisma.user.create({
-      data: { email: emailLc, password: passwordHash, name: String(name), locationId: locId },
-      select: { id: true, email: true, name: true, locationId: true },
-    });
-
-    const savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
-
-    const token = signToken({ sub: user.id, email: user.email, name: user.name, locationId: user.locationId });
-    return res.json({ ok: true, user, brand: savedBrand || null, token });
-  } catch (err) {
-    console.error('provision error', err);
     return res.status(500).json({ error: 'internal_error' });
   }
 });
