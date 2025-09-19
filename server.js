@@ -200,13 +200,16 @@ app.post('/api/users/provision', async (req, res) => {
  * Body: { email, password, name?, brand? }
  * Falls name fehlt, wird er aus brand.name oder dem Mail-Präfix erzeugt.
  */
+// ==== COMPAT: /api/session/signup (Alias für /api/users/provision) ====
 app.post('/api/session/signup', async (req, res) => {
   try {
     const { email, password, name, brand } = req.body || {};
 
+    // Fallback-Name: aus name | brand.name | brand (String) | local-part der E-Mail
     const displayName =
-      name ||
-      (typeof brand === 'string' ? brand : brand?.name) ||
+      (name && String(name).trim()) ||
+      (brand && typeof brand === 'object' && brand.name && String(brand.name).trim()) ||
+      (brand && typeof brand === 'string' && brand.trim()) ||
       (email ? String(email).split('@')[0] : '');
 
     if (!email || !password || !displayName) {
@@ -215,11 +218,14 @@ app.post('/api/session/signup', async (req, res) => {
 
     const emailLc = String(email).toLowerCase();
 
+    // Existiert der User schon?
     const exists = await prisma.user.findUnique({ where: { email: emailLc } });
     if (exists) return res.status(409).json({ error: 'user_already_exists' });
 
+    // Location-ID erzeugen
     const locId = `loc_${Math.random().toString(36).slice(2, 8)}`;
 
+    // Optional: Brand anlegen/patchen (nur wenn Objekt)
     if (brand && typeof brand === 'object') {
       const clean = {
         id: locId,
@@ -236,17 +242,57 @@ app.post('/api/session/signup', async (req, res) => {
         cancellation_notice: brand.cancellation_notice ?? null,
         agb_link: brand.agb_link ?? null,
       };
-      await prisma.brand.upsert({ where: { id: locId }, update: clean, create: clean });
+      try {
+        await prisma.brand.upsert({ where: { id: locId }, update: clean, create: clean });
+      } catch (err) {
+        // Brand-Fehler separat loggen, damit wir sehen, ob es hier knallt
+        console.error('[signup] brand.upsert failed', {
+          message: err?.message,
+          code: err?.code,
+          meta: err?.meta,
+          stack: err?.stack,
+        });
+        return res.status(500).json({ error: 'brand_upsert_failed' });
+      }
     }
 
+    // Passwort hashen & User anlegen
     const passwordHash = await bcrypt.hash(String(password), 10);
-    const user = await prisma.user.create({
-      data: { email: emailLc, password: passwordHash, name: String(displayName), locationId: locId },
-      select: { id: true, email: true, name: true, locationId: true },
-    });
 
-    const savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
+    let user;
+    try {
+      user = await prisma.user.create({
+        data: { email: emailLc, password: passwordHash, name: String(displayName), locationId: locId },
+        select: { id: true, email: true, name: true, locationId: true },
+      });
+    } catch (err) {
+      // Prisma-Fehler sauber mappen
+      console.error('[signup] user.create failed', {
+        message: err?.message,
+        code: err?.code,
+        meta: err?.meta,
+        stack: err?.stack,
+      });
+      // P2002 = Unique constraint (z.B. E-Mail doppelt)
+      if (err?.code === 'P2002') return res.status(409).json({ error: 'user_already_exists' });
+      // P2000/P2003 usw. => Schema/Foreign-Key/Validation
+      return res.status(400).json({ error: 'user_create_failed' });
+    }
 
+    // Brand zurückgeben (falls vorhanden)
+    let savedBrand = null;
+    try {
+      savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
+    } catch (err) {
+      console.error('[signup] brand.findUnique failed', {
+        message: err?.message,
+        code: err?.code,
+        meta: err?.meta,
+        stack: err?.stack,
+      });
+    }
+
+    // JWT ausstellen
     const token = signToken({
       sub: user.id,
       email: user.email,
@@ -256,10 +302,17 @@ app.post('/api/session/signup', async (req, res) => {
 
     return res.json({ ok: true, user, brand: savedBrand || null, token });
   } catch (err) {
-    console.error('signup error', err);
+    // Catch-all: ALLES loggen, damit wir wissen, was los ist
+    console.error('[signup] fatal', {
+      message: err?.message,
+      code: err?.code,
+      meta: err?.meta,
+      stack: err?.stack,
+    });
     return res.status(500).json({ error: 'internal_error' });
   }
 });
+
 
 // ======== Login ========
 /**
