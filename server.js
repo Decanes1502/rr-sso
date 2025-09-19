@@ -208,6 +208,9 @@ app.post('/api/users/provision', async (req, res) => {
  * Falls name fehlt, wird er aus brand.name oder dem Mail-Präfix erzeugt.
  */
 // ==== COMPAT: /api/session/signup (Alias für /api/users/provision) ====
+/**
+ * POST /api/session/signup  — Alias zu /api/users/provision
+ */
 app.post('/api/session/signup', async (req, res) => {
   try {
     const { email, password, name, brand } = req.body || {};
@@ -229,7 +232,7 @@ app.post('/api/session/signup', async (req, res) => {
 
     const locId = `loc_${Math.random().toString(36).slice(2, 8)}`;
 
-    // ⭐ WICHTIG: Brand IMMER sicherstellen – auch wenn kein brand-Objekt mitkam
+    // Brand IMMER zuerst sicherstellen
     try {
       await ensureBrandExists(locId, (typeof brand === 'object') ? brand : undefined);
     } catch (err) {
@@ -262,27 +265,7 @@ app.post('/api/session/signup', async (req, res) => {
     return res.status(500).json({ error: 'internal_error' });
   }
 });
-
-    // JWT ausstellen
-    const token = signToken({
-      sub: user.id,
-      email: user.email,
-      name: user.name,
-      locationId: user.locationId,
-    });
-
-    return res.json({ ok: true, user, brand: savedBrand || null, token });
-  } catch (err) {
-    // Catch-all: ALLES loggen, damit wir wissen, was los ist
-    console.error('[signup] fatal', {
-      message: err?.message,
-      code: err?.code,
-      meta: err?.meta,
-      stack: err?.stack,
-    });
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
+// >>> hier direkt geht’s weiter mit:  // ======== Login ========
 
 
 // ======== Login ========
