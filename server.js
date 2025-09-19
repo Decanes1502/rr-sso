@@ -120,6 +120,30 @@ function auth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
+async function ensureBrandExists(locId, brandInput) {
+  // brandInput kann fehlen; dann schreiben wir leere Felder (null)
+  const clean = {
+    id: String(locId),
+    logo: brandInput?.logo ?? null,
+    name: brandInput?.name ?? null,
+    street: brandInput?.street ?? null,
+    zipcity: brandInput?.zipcity ?? null,
+    person: brandInput?.person ?? null,
+    phone: brandInput?.phone ?? null,
+    mail: brandInput?.mail ?? null,
+    web: brandInput?.web ?? null,
+    validity_days: brandInput?.validity_days ?? null,
+    payment_terms: brandInput?.payment_terms ?? null,
+    cancellation_notice: brandInput?.cancellation_notice ?? null,
+    agb_link: brandInput?.agb_link ?? null,
+  };
+  // upsert stellt sicher: existiert → update, sonst create
+  return prisma.brand.upsert({
+    where: { id: clean.id },
+    update: clean,
+    create: clean,
+  });
+}
 
 function billingEnabled() {
   return !!(STRIPE_SECRET_KEY && ALLOWED_PRICE_IDS.length > 0);
@@ -153,31 +177,14 @@ app.post('/api/users/provision', async (req, res) => {
       ? String(locationId).trim()
       : `loc_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Optional: Brand upsert
-    if (brand && typeof brand === 'object') {
-      const clean = {
-        id: locId,
-        logo: brand.logo ?? null,
-        name: brand.name ?? null,
-        street: brand.street ?? null,
-        zipcity: brand.zipcity ?? null,
-        person: brand.person ?? null,
-        phone: brand.phone ?? null,
-        mail: brand.mail ?? null,
-        web: brand.web ?? null,
-        validity_days: brand.validity_days ?? null,
-        payment_terms: brand.payment_terms ?? null,
-        cancellation_notice: brand.cancellation_notice ?? null,
-        agb_link: brand.agb_link ?? null,
-      };
-      await prisma.brand.upsert({
-        where: { id: locId },
-        update: clean,
-        create: clean,
-      });
+    // ⭐ Immer zuerst Brand vorhanden machen (auch wenn brand fehlt)
+    try {
+      await ensureBrandExists(locId, (typeof brand === 'object') ? brand : undefined);
+    } catch (err) {
+      console.error('[provision] brand.ensure failed', { message: err?.message, code: err?.code, meta: err?.meta });
+      return res.status(500).json({ error: 'brand_upsert_failed' });
     }
 
-    // Passwort sichern
     const passwordHash = await bcrypt.hash(String(password), 10);
 
     const user = await prisma.user.create({
@@ -205,7 +212,6 @@ app.post('/api/session/signup', async (req, res) => {
   try {
     const { email, password, name, brand } = req.body || {};
 
-    // Fallback-Name: aus name | brand.name | brand (String) | local-part der E-Mail
     const displayName =
       (name && String(name).trim()) ||
       (brand && typeof brand === 'object' && brand.name && String(brand.name).trim()) ||
@@ -218,45 +224,19 @@ app.post('/api/session/signup', async (req, res) => {
 
     const emailLc = String(email).toLowerCase();
 
-    // Existiert der User schon?
     const exists = await prisma.user.findUnique({ where: { email: emailLc } });
     if (exists) return res.status(409).json({ error: 'user_already_exists' });
 
-    // Location-ID erzeugen
     const locId = `loc_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Optional: Brand anlegen/patchen (nur wenn Objekt)
-    if (brand && typeof brand === 'object') {
-      const clean = {
-        id: locId,
-        logo: brand.logo ?? null,
-        name: brand.name ?? null,
-        street: brand.street ?? null,
-        zipcity: brand.zipcity ?? null,
-        person: brand.person ?? null,
-        phone: brand.phone ?? null,
-        mail: brand.mail ?? null,
-        web: brand.web ?? null,
-        validity_days: brand.validity_days ?? null,
-        payment_terms: brand.payment_terms ?? null,
-        cancellation_notice: brand.cancellation_notice ?? null,
-        agb_link: brand.agb_link ?? null,
-      };
-      try {
-        await prisma.brand.upsert({ where: { id: locId }, update: clean, create: clean });
-      } catch (err) {
-        // Brand-Fehler separat loggen, damit wir sehen, ob es hier knallt
-        console.error('[signup] brand.upsert failed', {
-          message: err?.message,
-          code: err?.code,
-          meta: err?.meta,
-          stack: err?.stack,
-        });
-        return res.status(500).json({ error: 'brand_upsert_failed' });
-      }
+    // ⭐ WICHTIG: Brand IMMER sicherstellen – auch wenn kein brand-Objekt mitkam
+    try {
+      await ensureBrandExists(locId, (typeof brand === 'object') ? brand : undefined);
+    } catch (err) {
+      console.error('[signup] brand.ensure failed', { message: err?.message, code: err?.code, meta: err?.meta });
+      return res.status(500).json({ error: 'brand_upsert_failed' });
     }
 
-    // Passwort hashen & User anlegen
     const passwordHash = await bcrypt.hash(String(password), 10);
 
     let user;
@@ -266,31 +246,22 @@ app.post('/api/session/signup', async (req, res) => {
         select: { id: true, email: true, name: true, locationId: true },
       });
     } catch (err) {
-      // Prisma-Fehler sauber mappen
-      console.error('[signup] user.create failed', {
-        message: err?.message,
-        code: err?.code,
-        meta: err?.meta,
-        stack: err?.stack,
-      });
-      // P2002 = Unique constraint (z.B. E-Mail doppelt)
+      console.error('[signup] user.create failed', { message: err?.message, code: err?.code, meta: err?.meta });
       if (err?.code === 'P2002') return res.status(409).json({ error: 'user_already_exists' });
-      // P2000/P2003 usw. => Schema/Foreign-Key/Validation
       return res.status(400).json({ error: 'user_create_failed' });
     }
 
-    // Brand zurückgeben (falls vorhanden)
     let savedBrand = null;
-    try {
-      savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } });
-    } catch (err) {
-      console.error('[signup] brand.findUnique failed', {
-        message: err?.message,
-        code: err?.code,
-        meta: err?.meta,
-        stack: err?.stack,
-      });
-    }
+    try { savedBrand = await prisma.brand.findUnique({ where: { id: user.locationId } }); } catch {}
+
+    const token = signToken({ sub: user.id, email: user.email, name: user.name, locationId: user.locationId });
+
+    return res.json({ ok: true, user, brand: savedBrand || null, token });
+  } catch (err) {
+    console.error('[signup] fatal', { message: err?.message, code: err?.code, meta: err?.meta, stack: err?.stack });
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
 
     // JWT ausstellen
     const token = signToken({
