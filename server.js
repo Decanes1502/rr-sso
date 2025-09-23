@@ -522,22 +522,102 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       return res.status(400).json({ error: 'no_price_configured' });
     }
 
-  // --- sichere Success/Cancel URLs bauen ---
-function buildUrl(base, params) {
-  const u = new URL((base || '').trim());
-  Object.entries(params || {}).forEach(([k, v]) => u.searchParams.set(k, v));
-  return u.toString();
-}
+    // --- sichere Success/Cancel URLs bauen ---
+    function buildUrl(base, params) {
+      const u = new URL((base || '').trim());
+      Object.entries(params || {}).forEach(([k, v]) => u.searchParams.set(k, v));
+      return u.toString();
+    }
 
-const success = buildUrl(APP_BASE_URL, { checkout: 'success' });
-const cancel  = buildUrl(APP_BASE_URL, { checkout: 'cancel' });
+    const success = buildUrl(APP_BASE_URL, { checkout: 'success' });
+    const cancel  = buildUrl(APP_BASE_URL, { checkout: 'cancel' });
 
-console.log('[checkout] using urls', {
-  APP_BASE_URL,
-  success,
-  cancel,
-  chosenPrice,
+    console.log('[checkout] using urls', {
+      APP_BASE_URL,
+      success,
+      cancel,
+      chosenPrice,
+    });
+
+    try {
+      const s = new URL(success);
+      const c = new URL(cancel);
+      if (s.protocol !== 'https:' || c.protocol !== 'https:') {
+        throw new Error('URLs must be https');
+      }
+    } catch (e) {
+      console.error('[checkout] invalid URL(s)', { success, cancel, msg: e.message });
+      return res.status(400).json({ error: 'invalid_success_or_cancel_url' });
+    }
+
+    // --- HIER: subscription_data DEFINIEREN (war bei dir weg/verschoben) ---
+    const subscription_data = {
+      metadata: {
+        rr_user_id: req.user.sub,
+        rr_location_id: req.user.locationId,
+        rr_email: req.user.email,
+      },
+      ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
+    };
+
+    // Eindeutige Referenz, die wir später im Webhook wiedersehen
+    const rr_ref = makeCheckoutRef(req.user.sub);
+
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      customer_email: req.user.email,
+      line_items: [{ price: chosenPrice, quantity: 1 }],
+      allow_promotion_codes: true,
+      client_reference_id: req.user.sub,
+      success_url: success,
+      cancel_url: cancel,
+
+      // Steuer + Adress-/USt-ID-Abfrage
+      automatic_tax: { enabled: true },
+      billing_address_collection: 'required',
+      tax_id_collection: { enabled: true },
+
+      // genutzt – muss vorher definiert sein
+      subscription_data,
+
+      // Eigene Metadaten für Zuordnung in GHL/Workflows
+      metadata: {
+        rr_user_id: req.user.sub,
+        rr_location_id: req.user.locationId,
+        rr_email: req.user.email,
+        rr_checkout_ref: rr_ref,
+        rr_price_id: chosenPrice,
+      },
+
+      // Name-Felder im Checkout
+      custom_fields: [
+        {
+          key: 'first_name',
+          label: { type: 'custom', custom: 'Vorname' },
+          type: 'text',
+          optional: false,
+        },
+        {
+          key: 'last_name',
+          label: { type: 'custom', custom: 'Nachname' },
+          type: 'text',
+          optional: true,
+        },
+      ],
+    });
+
+    return res.json({ url: session.url });
+  } catch (err) {
+    console.error('checkout error:', {
+      message: err?.message,
+      rawMessage: err?.raw?.message,
+      rawParam: err?.raw?.param,
+      statusCode: err?.statusCode
+    });
+    return res.status(500).json({ error: 'internal_error' });
+  }
 });
+
 
 try {
   const s = new URL(success);
