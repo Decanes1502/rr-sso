@@ -26,7 +26,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
   .map(s => s.trim())
   .filter(Boolean);
 
-// z.B. https://reinigungsrechner.de/unterhaltesreinigung  (für Stripe success/cancel)
+// z.B. https://reinigungsrechner.de/dankeseite  (wir hängen ?checkout=success/cancel an)
 const APP_BASE_URL = (process.env.APP_BASE_URL || '').trim() || 'http://localhost:5173';
 
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
@@ -539,6 +539,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       chosenPrice,
     });
 
+    // Validierung: absolute https-URLs
     try {
       const s = new URL(success);
       const c = new URL(cancel);
@@ -550,7 +551,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       return res.status(400).json({ error: 'invalid_success_or_cancel_url' });
     }
 
-    // --- HIER: subscription_data DEFINIEREN (war bei dir weg/verschoben) ---
+    // Metadaten für Subscription
     const subscription_data = {
       metadata: {
         rr_user_id: req.user.sub,
@@ -577,7 +578,6 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       billing_address_collection: 'required',
       tax_id_collection: { enabled: true },
 
-      // genutzt – muss vorher definiert sein
       subscription_data,
 
       // Eigene Metadaten für Zuordnung in GHL/Workflows
@@ -590,80 +590,6 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       },
 
       // Name-Felder im Checkout
-      custom_fields: [
-        {
-          key: 'first_name',
-          label: { type: 'custom', custom: 'Vorname' },
-          type: 'text',
-          optional: false,
-        },
-        {
-          key: 'last_name',
-          label: { type: 'custom', custom: 'Nachname' },
-          type: 'text',
-          optional: true,
-        },
-      ],
-    });
-
-    return res.json({ url: session.url });
-  } catch (err) {
-    console.error('checkout error:', {
-      message: err?.message,
-      rawMessage: err?.raw?.message,
-      rawParam: err?.raw?.param,
-      statusCode: err?.statusCode
-    });
-    return res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-
-try {
-  const s = new URL(success);
-  const c = new URL(cancel);
-  if (s.protocol !== 'https:' || c.protocol !== 'https:') {
-    throw new Error('URLs must be https');
-  }
-} catch (e) {
-  console.error('[checkout] invalid URL(s)', { success, cancel, msg: e.message });
-  return res.status(400).json({ error: 'invalid_success_or_cancel_url' });
-}
-
-
-
-    // Eindeutige Referenz, die wir später im Webhook wiedersehen
-    const rr_ref = makeCheckoutRef(req.user.sub);
-
-    const session = await stripe.checkout.sessions.create({
-      mode: 'subscription',
-      customer_email: req.user.email,
-      line_items: [{ price: chosenPrice, quantity: 1 }],
-      allow_promotion_codes: true,
-      client_reference_id: req.user.sub,
-      success_url: success,
-      cancel_url: cancel,
-
-      // sorgt dafür, dass ein Stripe-Customer persistiert wird (mit Name etc.)
-      // customer_creation ist nur in 'payment'-Mode erlaubt, daher hier NICHT gesetzt
-
-      // Steuer + Adress-/USt-ID-Abfrage
-      automatic_tax: { enabled: true },
-      billing_address_collection: 'required',
-      tax_id_collection: { enabled: true },
-
-      subscription_data,
-
-      // Eigene Metadaten für Zuordnung in GHL/Workflows
-      metadata: {
-        rr_user_id: req.user.sub,
-        rr_location_id: req.user.locationId,
-        rr_email: req.user.email,
-        rr_checkout_ref: rr_ref,
-        rr_price_id: chosenPrice,
-      },
-
-      // Eigene Felder im Checkout (Name einsammeln)
       custom_fields: [
         {
           key: 'first_name',
@@ -787,7 +713,7 @@ app.get('/api/subscription/status', async (req, res) => {
 
 // ===== Debug: Ping & Routenliste
 app.get('/api/_ping', (_req, res) => {
-  res.json({ ok: true, version: 'serverjs-2025-09-03-tax-enabled-namefields' });
+  res.json({ ok: true, version: 'serverjs-2025-09-23-clean' });
 });
 function listRoutes() {
   const routes = [];
