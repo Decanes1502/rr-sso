@@ -522,17 +522,35 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       return res.status(400).json({ error: 'no_price_configured' });
     }
 
-    const success = `${APP_BASE_URL}?checkout=success`;
-    const cancel  = `${APP_BASE_URL}?checkout=cancel`;
+  // --- sichere Success/Cancel URLs bauen ---
+function buildUrl(base, params) {
+  const u = new URL((base || '').trim());
+  Object.entries(params || {}).forEach(([k, v]) => u.searchParams.set(k, v));
+  return u.toString();
+}
 
-    const subscription_data = {
-      metadata: {
-        rr_user_id: req.user.sub,
-        rr_location_id: req.user.locationId,
-        rr_email: req.user.email,
-      },
-      ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
-    };
+const success = buildUrl(APP_BASE_URL, { checkout: 'success' });
+const cancel  = buildUrl(APP_BASE_URL, { checkout: 'cancel' });
+
+console.log('[checkout] using urls', {
+  APP_BASE_URL,
+  success,
+  cancel,
+  chosenPrice,
+});
+
+try {
+  const s = new URL(success);
+  const c = new URL(cancel);
+  if (s.protocol !== 'https:' || c.protocol !== 'https:') {
+    throw new Error('URLs must be https');
+  }
+} catch (e) {
+  console.error('[checkout] invalid URL(s)', { success, cancel, msg: e.message });
+  return res.status(400).json({ error: 'invalid_success_or_cancel_url' });
+}
+
+
 
     // Eindeutige Referenz, die wir später im Webhook wiedersehen
     const rr_ref = makeCheckoutRef(req.user.sub);
