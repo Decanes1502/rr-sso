@@ -221,6 +221,54 @@ function makeCheckoutRef(userId) {
   return `rr_${(userId || 'anon').toString().slice(-6)}_${rand}`;
 }
 
+// ======== Paywall-Middleware (Server-seitig absichern) ========
+async function requireActiveSubscription(req, res, next){
+  const hdr = req.headers['authorization'] || '';
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
+  if (!token) return res.status(401).json({ error: 'Missing token' });
+
+  let payload;
+  try { payload = jwt.verify(token, JWT_SECRET); }
+  catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
+
+  if (!stripe || ALLOWED_PRICE_IDS.length === 0) {
+    return res.status(402).json({ error: 'subscription_required' });
+  }
+
+  const allowed = new Set(ALLOWED_PRICE_IDS);
+
+  // 1) Suche per rr_user_id (metadata)
+  try {
+    const q = `metadata['rr_user_id']:"${payload.sub}" AND (status:"active" OR status:"trialing")`;
+    const found = await stripe.subscriptions.search({ query: q, limit: 5, expand: ['data.items'] });
+    const ok = (found?.data||[]).some(s =>
+      (s.items?.data||[]).some(it => it.price && allowed.has(it.price.id))
+    );
+    if (ok) return next();
+  } catch {}
+
+  // 2) Fallback: per E-Mail
+  try {
+    const email = String(payload.email||'').toLowerCase();
+    if (!email) return res.status(402).json({ error: 'subscription_inactive' });
+
+    const list = await stripe.customers.list({ email, limit: 10 });
+    const customers = list?.data || [];
+    for (const c of customers) {
+      const subs = (await stripe.subscriptions.list({
+        customer: c.id, status: 'all', limit: 20, expand: ['data.items']
+      }))?.data || [];
+      const active = subs.some(s =>
+        (s.status === 'active' || s.status === 'trialing') &&
+        (s.items?.data||[]).some(it => it.price && allowed.has(it.price.id))
+      );
+      if (active) return next();
+    }
+  } catch {}
+
+  return res.status(402).json({ error: 'subscription_inactive' });
+}
+
 // ======== Health & Billing Flag ========
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
@@ -421,8 +469,9 @@ async function brandSyncHandler(req, res) {
     return res.status(500).json({ error: 'internal_error' });
   }
 }
-app.post('/api/brand/sync', brandSyncHandler);
-app.patch('/api/brand/sync', brandSyncHandler);
+// ⇣⇣⇣ Paywall hier aktivieren (nur mit aktivem/trial Abo erlaubt):
+app.post('/api/brand/sync', auth, requireActiveSubscription, brandSyncHandler);
+app.patch('/api/brand/sync', auth, requireActiveSubscription, brandSyncHandler);
 
 // ======== Billing: Checkout (Stripe Tax aktiviert) ========
 app.post('/api/billing/checkout', auth, async (req, res) => {
