@@ -221,54 +221,6 @@ function makeCheckoutRef(userId) {
   return `rr_${(userId || 'anon').toString().slice(-6)}_${rand}`;
 }
 
-// ======== Paywall-Middleware (Server-seitig absichern) ========
-async function requireActiveSubscription(req, res, next){
-  const hdr = req.headers['authorization'] || '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
-  if (!token) return res.status(401).json({ error: 'Missing token' });
-
-  let payload;
-  try { payload = jwt.verify(token, JWT_SECRET); }
-  catch { return res.status(401).json({ error: 'Invalid or expired token' }); }
-
-  if (!stripe || ALLOWED_PRICE_IDS.length === 0) {
-    return res.status(402).json({ error: 'subscription_required' });
-  }
-
-  const allowed = new Set(ALLOWED_PRICE_IDS);
-
-  // 1) Suche per rr_user_id (metadata)
-  try {
-    const q = `metadata['rr_user_id']:"${payload.sub}" AND (status:"active" OR status:"trialing")`;
-    const found = await stripe.subscriptions.search({ query: q, limit: 5, expand: ['data.items'] });
-    const ok = (found?.data||[]).some(s =>
-      (s.items?.data||[]).some(it => it.price && allowed.has(it.price.id))
-    );
-    if (ok) return next();
-  } catch {}
-
-  // 2) Fallback: per E-Mail
-  try {
-    const email = String(payload.email||'').toLowerCase();
-    if (!email) return res.status(402).json({ error: 'subscription_inactive' });
-
-    const list = await stripe.customers.list({ email, limit: 10 });
-    const customers = list?.data || [];
-    for (const c of customers) {
-      const subs = (await stripe.subscriptions.list({
-        customer: c.id, status: 'all', limit: 20, expand: ['data.items']
-      }))?.data || [];
-      const active = subs.some(s =>
-        (s.status === 'active' || s.status === 'trialing') &&
-        (s.items?.data||[]).some(it => it.price && allowed.has(it.price.id))
-      );
-      if (active) return next();
-    }
-  } catch {}
-
-  return res.status(402).json({ error: 'subscription_inactive' });
-}
-
 // ======== Health & Billing Flag ========
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
 
@@ -405,6 +357,89 @@ app.post('/api/session/login', async (req, res) => {
   }
 });
 
+// ======== Passwort-Reset (leichtgewichtig) ========
+// POST /api/session/forgot-password
+// Body: { email }
+app.post('/api/session/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    const emailLc = (email || '').toLowerCase().trim();
+    if (!emailLc) return res.status(400).json({ error: 'email_required' });
+
+    let user = null;
+    try {
+      user = await prisma.user.findUnique({ where: { email: emailLc }, select: { id: true, email: true, name: true } });
+    } catch {}
+
+    // Immer 200 zurückgeben (kein User-Leak)
+    let reset_url = null;
+    if (user) {
+      const resetToken = jwt.sign(
+        { kind: 'pwreset', sub: user.id, email: user.email },
+        JWT_SECRET,
+        { algorithm: 'HS256', expiresIn: 30 * 60 } // 30 Minuten
+      );
+      reset_url = `${APP_BASE_URL}?reset=${encodeURIComponent(resetToken)}`;
+
+      // Optional an GHL
+      if (GHL_WEBHOOK_URL) {
+        try {
+          await fetch(GHL_WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(GHL_WEBHOOK_SECRET ? { 'x-ghl-signature': GHL_WEBHOOK_SECRET } : {}),
+            },
+            body: JSON.stringify({
+              source: 'rr-sso',
+              eventType: 'rr.password.forgot',
+              data: { email: user.email, userId: user.id, reset_url }
+            }),
+          });
+        } catch (e) {
+          console.warn('[forgot-password] forward failed:', e?.message);
+        }
+      }
+    }
+
+    // Für MVP geben wir die URL zurück (sonst nur { ok: true }).
+    return res.json({ ok: true, reset_url: reset_url || null });
+  } catch (err) {
+    console.error('[forgot-password] fatal', err);
+    return res.status(200).json({ ok: true });
+  }
+});
+
+// POST /api/session/reset-password
+// Body: { token, password }
+app.post('/api/session/reset-password', async (req, res) => {
+  try {
+    const { token, password } = req.body || {};
+    if (!token || !password) return res.status(400).json({ error: 'token_and_password_required' });
+
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET); // { kind:'pwreset', sub, email, iat, exp }
+    } catch {
+      return res.status(400).json({ error: 'invalid_or_expired_token' });
+    }
+    if (payload.kind !== 'pwreset' || !payload.sub) {
+      return res.status(400).json({ error: 'invalid_token_kind' });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    await prisma.user.update({
+      where: { id: String(payload.sub) },
+      data: { password: passwordHash },
+    });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error('[reset-password] fatal', err);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 // ======== Me ========
 /**
  * GET /api/me  (Authorization: Bearer <token>)
@@ -469,9 +504,8 @@ async function brandSyncHandler(req, res) {
     return res.status(500).json({ error: 'internal_error' });
   }
 }
-// ⇣⇣⇣ Paywall hier aktivieren (nur mit aktivem/trial Abo erlaubt):
-app.post('/api/brand/sync', auth, requireActiveSubscription, brandSyncHandler);
-app.patch('/api/brand/sync', auth, requireActiveSubscription, brandSyncHandler);
+app.post('/api/brand/sync', brandSyncHandler);
+app.patch('/api/brand/sync', brandSyncHandler);
 
 // ======== Billing: Checkout (Stripe Tax aktiviert) ========
 app.post('/api/billing/checkout', auth, async (req, res) => {
@@ -500,26 +534,29 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
     };
 
-    // Eindeutige Referenz für GHL/Debug
+    // Eindeutige Referenz, die wir später im Webhook wiedersehen
     const rr_ref = makeCheckoutRef(req.user.sub);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: req.user.email,                 // Customer wird automatisch erzeugt/zugeordnet
+      customer_email: req.user.email,
       line_items: [{ price: chosenPrice, quantity: 1 }],
       allow_promotion_codes: true,
       client_reference_id: req.user.sub,
       success_url: success,
       cancel_url: cancel,
 
-      // Steuern + Adress-/USt-ID
+      // sorgt dafür, dass ein Stripe-Customer persistiert wird (mit Name etc.)
+      // customer_creation ist nur in 'payment'-Mode erlaubt, daher hier NICHT gesetzt
+
+      // Steuer + Adress-/USt-ID-Abfrage
       automatic_tax: { enabled: true },
       billing_address_collection: 'required',
       tax_id_collection: { enabled: true },
 
       subscription_data,
 
-      // Eigene Metadaten (für Workflows/GHL)
+      // Eigene Metadaten für Zuordnung in GHL/Workflows
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
@@ -528,7 +565,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
         rr_price_id: chosenPrice,
       },
 
-      // Name-Felder im Checkout (weiterhin ok)
+      // Eigene Felder im Checkout (Name einsammeln)
       custom_fields: [
         {
           key: 'first_name',
