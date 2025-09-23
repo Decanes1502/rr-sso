@@ -500,29 +500,26 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
     };
 
-    // Eindeutige Referenz, die wir später im Webhook wiedersehen
+    // Eindeutige Referenz für GHL/Debug
     const rr_ref = makeCheckoutRef(req.user.sub);
 
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: req.user.email,
+      customer_email: req.user.email,                 // Customer wird automatisch erzeugt/zugeordnet
       line_items: [{ price: chosenPrice, quantity: 1 }],
       allow_promotion_codes: true,
       client_reference_id: req.user.sub,
       success_url: success,
       cancel_url: cancel,
 
-      // sorgt dafür, dass ein Stripe-Customer persistiert wird (mit Name etc.)
-      customer_creation: 'always',
-
-      // Steuer + Adress-/USt-ID-Abfrage
+      // Steuern + Adress-/USt-ID
       automatic_tax: { enabled: true },
       billing_address_collection: 'required',
       tax_id_collection: { enabled: true },
 
       subscription_data,
 
-      // Eigene Metadaten für Zuordnung in GHL/Workflows
+      // Eigene Metadaten (für Workflows/GHL)
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
@@ -531,7 +528,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
         rr_price_id: chosenPrice,
       },
 
-      // >>> NEU: Eigene Felder im Checkout (Variante A+B gleichzeitig)
+      // Name-Felder im Checkout (weiterhin ok)
       custom_fields: [
         {
           key: 'first_name',
