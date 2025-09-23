@@ -39,8 +39,8 @@ const ALLOWED_PRICE_IDS = (process.env.ALLOWED_PRICE_IDS || STRIPE_PRICE_ID || '
 const TRIAL_DAYS = parseInt(process.env.TRIAL_DAYS || '0', 10);
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET || '';
 
-const GHL_WEBHOOK_URL    = process.env.GHL_WEBHOOK_URL || '';       // optional
-const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || '';     // optional
+const GHL_WEBHOOK_URL    = process.env.GHL_WEBHOOK_URL || '';   // optional
+const GHL_WEBHOOK_SECRET = process.env.GHL_WEBHOOK_SECRET || ''; // optional
 
 // Stripe initialisieren (nur wenn Key vorhanden)
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY, { apiVersion: '2023-10-16' }) : null;
@@ -70,37 +70,94 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     const event = stripe.webhooks.constructEvent(req.body, sig, STRIPE_WEBHOOK_SECRET);
     console.log('[webhook] type=', event.type);
 
-    // Optional: an GHL weiterleiten (pass-through)
-    if (GHL_WEBHOOK_URL) {
-      try {
-        const obj = event.data?.object || null;
-        // Robust eine Referenz finden
-        const ref =
-          obj?.metadata?.rr_checkout_ref ||
-          obj?.metadata?.rr_ref ||
-          obj?.client_reference_id ||
-          null;
+    // === Name & Metadaten bei erfolgreichem Checkout einsammeln / speichern ===
+    if (event.type === 'checkout.session.completed') {
+      const sess = event.data.object; // Checkout Session
 
-        await fetch(GHL_WEBHOOK_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(GHL_WEBHOOK_SECRET ? { 'x-ghl-signature': GHL_WEBHOOK_SECRET } : {}),
-            ...(ref ? { 'x-rr-ref': ref } : {}),
-          },
-          body: JSON.stringify({
+      // 1) Namen bevorzugt aus custom_fields holen (Vorname/Nachname separat)
+      const cf = Array.isArray(sess.custom_fields) ? sess.custom_fields : [];
+      const getCF = (key) => cf.find(f => f.key === key)?.text?.value || '';
+      let firstName = getCF('first_name');
+      let lastName  = getCF('last_name');
+
+      // 2) Fallback: gesamten Namen splitten
+      if (!firstName && sess?.customer_details?.name) {
+        const parts = String(sess.customer_details.name).trim().split(/\s+/);
+        firstName = parts.shift() || '';
+        lastName  = parts.join(' ');
+      }
+
+      // rr_checkout_ref ggf. aus Session-Metadata mitnehmen
+      const rrCheckoutRef = sess?.metadata?.rr_checkout_ref || '';
+
+      // In Subscription & Customer-Metadata persistieren (damit GHL später leicht rankommt)
+      try {
+        if (sess.subscription && stripe) {
+          await stripe.subscriptions.update(sess.subscription, {
+            metadata: {
+              ...(sess.metadata || {}),
+              rr_first_name: firstName || '',
+              rr_last_name: lastName || '',
+              rr_checkout_ref: rrCheckoutRef || '',
+            },
+          });
+        }
+        if (sess.customer && stripe) {
+          await stripe.customers.update(sess.customer, {
+            name: [firstName, lastName].filter(Boolean).join(' ') || undefined,
+            metadata: {
+              rr_first_name: firstName || '',
+              rr_last_name: lastName || '',
+              rr_checkout_ref: rrCheckoutRef || '',
+            },
+          });
+        }
+      } catch (e) {
+        console.warn('[webhook] name/metadata propagate failed:', e?.message);
+      }
+
+      // Optional: an GHL weiterleiten (pass-through) – mit flachen Zusatzfeldern
+      if (GHL_WEBHOOK_URL) {
+        try {
+          const payload = {
             source: 'rr-sso',
             eventType: event.type,
-            ref,                    // <— flach oben
-            data: obj               // Original Stripe-Objekt mit metadata
-          }),
-        });
-      } catch (fwdErr) {
-        console.warn('[webhook] GHL forward failed:', fwdErr?.message);
+            data: sess, // Originalobjekt
+            // flach dazu:
+            rr_first_name: firstName || '',
+            rr_last_name: lastName || '',
+            rr_checkout_ref: rrCheckoutRef || '',
+          };
+          await fetch(GHL_WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(GHL_WEBHOOK_SECRET ? { 'x-ghl-signature': GHL_WEBHOOK_SECRET } : {}),
+            },
+            body: JSON.stringify(payload),
+          });
+        } catch (fwdErr) {
+          console.warn('[webhook] GHL forward failed:', fwdErr?.message);
+        }
+      }
+    } else {
+      // andere Events optional ebenfalls forwarden
+      if (GHL_WEBHOOK_URL) {
+        try {
+          await fetch(GHL_WEBHOOK_URL, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(GHL_WEBHOOK_SECRET ? { 'x-ghl-signature': GHL_WEBHOOK_SECRET } : {}),
+            },
+            body: JSON.stringify({ source: 'rr-sso', eventType: event.type, data: event.data?.object || null }),
+          });
+        } catch (fwdErr) {
+          console.warn('[webhook] GHL forward failed:', fwdErr?.message);
+        }
       }
     }
 
-    // Optional: hier DB-Flags setzen, E-Mails, etc.
     return res.status(200).send('[ok]');
   } catch (err) {
     console.error('[webhook] verify failed:', err.message);
@@ -132,7 +189,6 @@ function auth(req, res, next) {
 }
 
 async function ensureBrandExists(locId, brandInput) {
-  // brandInput kann fehlen; dann schreiben wir leere Felder (null)
   const clean = {
     id: String(locId),
     logo: brandInput?.logo ?? null,
@@ -148,7 +204,6 @@ async function ensureBrandExists(locId, brandInput) {
     cancellation_notice: brandInput?.cancellation_notice ?? null,
     agb_link: brandInput?.agb_link ?? null,
   };
-  // upsert stellt sicher: existiert → update, sonst create
   return prisma.brand.upsert({
     where: { id: clean.id },
     update: clean,
@@ -160,18 +215,10 @@ function billingEnabled() {
   return !!(STRIPE_SECRET_KEY && ALLOWED_PRICE_IDS.length > 0);
 }
 
-// NEU: eindeutige Referenz für Checkout/GHL
-function makeCheckoutRef() {
-  // z.B. rr_20250923_153045_ab12cd
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  const rnd = Math.random().toString(36).slice(2, 8);
-  return `rr_${y}${m}${day}_${hh}${mm}${ss}_${rnd}`;
+// Eindeutige Checkout-Ref für GHL/Debug
+function makeCheckoutRef(userId) {
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `rr_${(userId || 'anon').toString().slice(-6)}_${rand}`;
 }
 
 // ======== Health & Billing Flag ========
@@ -202,7 +249,6 @@ app.post('/api/users/provision', async (req, res) => {
       ? String(locationId).trim()
       : `loc_${Math.random().toString(36).slice(2, 8)}`;
 
-    // ⭐ Immer zuerst Brand vorhanden machen (auch wenn brand fehlt)
     try {
       await ensureBrandExists(locId, (typeof brand === 'object') ? brand : undefined);
     } catch (err) {
@@ -230,7 +276,6 @@ app.post('/api/users/provision', async (req, res) => {
 /**
  * POST /api/session/signup  — Alias zu /api/users/provision
  * Body: { email, password, name?, brand? }
- * Falls name fehlt, wird er aus brand.name oder dem Mail-Präfix erzeugt.
  */
 app.post('/api/session/signup', async (req, res) => {
   try {
@@ -253,7 +298,6 @@ app.post('/api/session/signup', async (req, res) => {
 
     const locId = `loc_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Brand IMMER zuerst sicherstellen
     try {
       await ensureBrandExists(locId, (typeof brand === 'object') ? brand : undefined);
     } catch (err) {
@@ -339,10 +383,6 @@ app.get('/api/me', auth, async (req, res) => {
 /**
  * POST /api/brand/sync  (Patch-Semantik)
  * PATCH /api/brand/sync
- * Body: { locationId, [logo,name,street,zipcity,person,phone,mail,web,validity_days,payment_terms,cancellation_notice,agb_link] }
- * Regeln:
- *   - Felder, die fehlen (undefined), bleiben unverändert
- *   - Felder, die explizit null sind, werden auf null gesetzt (löschen)
  */
 async function brandSyncHandler(req, res) {
   try {
@@ -367,7 +407,7 @@ async function brandSyncHandler(req, res) {
     let saved;
     if (existing) {
       const merged = { ...existing, ...patch };
-      const { id, ...data } = merged;            // id nicht updaten
+      const { id, ...data } = merged; // id nicht updaten
       saved = await prisma.brand.update({ where: { id: locationId }, data });
     } else {
       const data = { id: locationId };
@@ -391,7 +431,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       return res.status(400).json({ error: 'billing_disabled' });
     }
 
-    const { price_id, ref: refFromClient } = req.body || {};
+    const { price_id } = req.body || {};
     const chosenPrice = (price_id && ALLOWED_PRICE_IDS.includes(price_id))
       ? price_id
       : (STRIPE_PRICE_ID || ALLOWED_PRICE_IDS[0]);
@@ -402,48 +442,64 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
     const success = `${APP_BASE_URL}?checkout=success`;
     const cancel  = `${APP_BASE_URL}?checkout=cancel`;
 
-    // NEU: eindeutige Referenz (falls nicht vom Client mitgegeben)
-    const rr_ref = (refFromClient && String(refFromClient).trim()) || makeCheckoutRef();
-
     const subscription_data = {
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
         rr_email: req.user.email,
-        rr_checkout_ref: rr_ref,     // <— NEU
       },
       ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
     };
 
-    // Wichtig: KEIN "customer" & keine customer_update/customer_creation
+    // Eindeutige Referenz, die wir später im Webhook wiedersehen
+    const rr_ref = makeCheckoutRef(req.user.sub);
+
     const session = await stripe.checkout.sessions.create({
       mode: 'subscription',
-      customer_email: req.user.email,                // Kunde per E-Mail binden
+      customer_email: req.user.email,
       line_items: [{ price: chosenPrice, quantity: 1 }],
       allow_promotion_codes: true,
       client_reference_id: req.user.sub,
       success_url: success,
       cancel_url: cancel,
 
-      // Steuer aktivieren + Adress-/USt-ID-Abfrage
+      // sorgt dafür, dass ein Stripe-Customer persistiert wird (mit Name etc.)
+      customer_creation: 'always',
+
+      // Steuer + Adress-/USt-ID-Abfrage
       automatic_tax: { enabled: true },
       billing_address_collection: 'required',
       tax_id_collection: { enabled: true },
 
       subscription_data,
 
-      // Top-Level Metadaten (GHL achtet oft genau hier drauf)
+      // Eigene Metadaten für Zuordnung in GHL/Workflows
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
         rr_email: req.user.email,
-        rr_checkout_ref: rr_ref,     // <— NEU
-        rr_price_id: chosenPrice,    // optional: falls GHL price hier erwartet
+        rr_checkout_ref: rr_ref,
+        rr_price_id: chosenPrice,
       },
+
+      // >>> NEU: Eigene Felder im Checkout (Variante A+B gleichzeitig)
+      custom_fields: [
+        {
+          key: 'first_name',
+          label: { type: 'custom', custom: 'Vorname' },
+          type: 'text',
+          optional: false,
+        },
+        {
+          key: 'last_name',
+          label: { type: 'custom', custom: 'Nachname' },
+          type: 'text',
+          optional: true,
+        },
+      ],
     });
 
-    // NEU: ref zurückgeben (Frontend kann speichern/anzeigen)
-    return res.json({ url: session.url, ref: rr_ref });
+    return res.json({ url: session.url });
   } catch (err) {
     console.error('checkout error:', {
       message: err?.message,
@@ -550,7 +606,7 @@ app.get('/api/subscription/status', async (req, res) => {
 
 // ===== Debug: Ping & Routenliste
 app.get('/api/_ping', (_req, res) => {
-  res.json({ ok: true, version: 'serverjs-2025-09-03-tax-enabled+rrref' });
+  res.json({ ok: true, version: 'serverjs-2025-09-03-tax-enabled-namefields' });
 });
 function listRoutes() {
   const routes = [];
