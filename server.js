@@ -73,16 +73,26 @@ app.post('/api/stripe/webhook', express.raw({ type: 'application/json' }), async
     // Optional: an GHL weiterleiten (pass-through)
     if (GHL_WEBHOOK_URL) {
       try {
+        const obj = event.data?.object || null;
+        // Robust eine Referenz finden
+        const ref =
+          obj?.metadata?.rr_checkout_ref ||
+          obj?.metadata?.rr_ref ||
+          obj?.client_reference_id ||
+          null;
+
         await fetch(GHL_WEBHOOK_URL, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             ...(GHL_WEBHOOK_SECRET ? { 'x-ghl-signature': GHL_WEBHOOK_SECRET } : {}),
+            ...(ref ? { 'x-rr-ref': ref } : {}),
           },
           body: JSON.stringify({
             source: 'rr-sso',
             eventType: event.type,
-            data: event.data?.object || null
+            ref,                    // <— flach oben
+            data: obj               // Original Stripe-Objekt mit metadata
           }),
         });
       } catch (fwdErr) {
@@ -120,6 +130,7 @@ function auth(req, res, next) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
+
 async function ensureBrandExists(locId, brandInput) {
   // brandInput kann fehlen; dann schreiben wir leere Felder (null)
   const clean = {
@@ -147,6 +158,20 @@ async function ensureBrandExists(locId, brandInput) {
 
 function billingEnabled() {
   return !!(STRIPE_SECRET_KEY && ALLOWED_PRICE_IDS.length > 0);
+}
+
+// NEU: eindeutige Referenz für Checkout/GHL
+function makeCheckoutRef() {
+  // z.B. rr_20250923_153045_ab12cd
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  const rnd = Math.random().toString(36).slice(2, 8);
+  return `rr_${y}${m}${day}_${hh}${mm}${ss}_${rnd}`;
 }
 
 // ======== Health & Billing Flag ========
@@ -207,10 +232,6 @@ app.post('/api/users/provision', async (req, res) => {
  * Body: { email, password, name?, brand? }
  * Falls name fehlt, wird er aus brand.name oder dem Mail-Präfix erzeugt.
  */
-// ==== COMPAT: /api/session/signup (Alias für /api/users/provision) ====
-/**
- * POST /api/session/signup  — Alias zu /api/users/provision
- */
 app.post('/api/session/signup', async (req, res) => {
   try {
     const { email, password, name, brand } = req.body || {};
@@ -265,8 +286,6 @@ app.post('/api/session/signup', async (req, res) => {
     return res.status(500).json({ error: 'internal_error' });
   }
 });
-// >>> hier direkt geht’s weiter mit:  // ======== Login ========
-
 
 // ======== Login ========
 /**
@@ -372,7 +391,7 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       return res.status(400).json({ error: 'billing_disabled' });
     }
 
-    const { price_id } = req.body || {};
+    const { price_id, ref: refFromClient } = req.body || {};
     const chosenPrice = (price_id && ALLOWED_PRICE_IDS.includes(price_id))
       ? price_id
       : (STRIPE_PRICE_ID || ALLOWED_PRICE_IDS[0]);
@@ -383,11 +402,15 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
     const success = `${APP_BASE_URL}?checkout=success`;
     const cancel  = `${APP_BASE_URL}?checkout=cancel`;
 
+    // NEU: eindeutige Referenz (falls nicht vom Client mitgegeben)
+    const rr_ref = (refFromClient && String(refFromClient).trim()) || makeCheckoutRef();
+
     const subscription_data = {
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
         rr_email: req.user.email,
+        rr_checkout_ref: rr_ref,     // <— NEU
       },
       ...(TRIAL_DAYS > 0 ? { trial_period_days: TRIAL_DAYS } : {}),
     };
@@ -408,14 +431,19 @@ app.post('/api/billing/checkout', auth, async (req, res) => {
       tax_id_collection: { enabled: true },
 
       subscription_data,
+
+      // Top-Level Metadaten (GHL achtet oft genau hier drauf)
       metadata: {
         rr_user_id: req.user.sub,
         rr_location_id: req.user.locationId,
         rr_email: req.user.email,
+        rr_checkout_ref: rr_ref,     // <— NEU
+        rr_price_id: chosenPrice,    // optional: falls GHL price hier erwartet
       },
     });
 
-    return res.json({ url: session.url });
+    // NEU: ref zurückgeben (Frontend kann speichern/anzeigen)
+    return res.json({ url: session.url, ref: rr_ref });
   } catch (err) {
     console.error('checkout error:', {
       message: err?.message,
@@ -522,7 +550,7 @@ app.get('/api/subscription/status', async (req, res) => {
 
 // ===== Debug: Ping & Routenliste
 app.get('/api/_ping', (_req, res) => {
-  res.json({ ok: true, version: 'serverjs-2025-09-03-tax-enabled' });
+  res.json({ ok: true, version: 'serverjs-2025-09-03-tax-enabled+rrref' });
 });
 function listRoutes() {
   const routes = [];
